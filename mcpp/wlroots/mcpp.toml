@@ -199,6 +199,37 @@ compat.libdrm              = "2.4.134"
 compat.pixman              = "0.46.4"
 freedesktop.libxkbcommon   = "1.13.2"
 
+# ⚠️ THESE BELONG TO THE gles2 AND gbm FEATURES AND ARE DECLARED HERE ANYWAY,
+# because `[feature-deps]` DOES NOT LINK A kind = "shared" DEPENDENCY.
+#
+# The distinction is exact and was measured: the feature dependencies that are
+# kind = "lib" — libseat, libinput, libudev, libdisplay-info — work, because
+# their objects merge into this package and need no `-l` at all. EGL and GLESv2
+# are kind = "shared", so they need a link flag, and no flag arrives:
+#
+#   with them in [feature-deps.gles2]  ->  ld: undefined symbol: glActiveTexture,
+#                                          eglMakeCurrent, and 30 more
+#   plus mcpp::link_lib("EGL")         ->  links, but `-lEGL` is only a FLAG:
+#                                          ninja has no edge to bin/libEGL.so, so
+#                                          on a clean tree the executable may link
+#                                          first and lld reports
+#                                          "unable to find library -lEGL".
+#                                          It passed locally only because the
+#                                          mcpp subos ships a libEGL.so.1 of its
+#                                          own — the same library, silently
+#                                          standing in for the one this package
+#                                          declares. `ldd` on the test binary
+#                                          named .../subos/default/lib/libEGL.so.1
+#                                          rather than the one in bin/.
+#
+# A plain dependency both links and creates the ninja edge. The cost is that a
+# build with `default-features = false` still fetches and builds them; the
+# FEATURE still decides whether the renderer SOURCES are compiled and what
+# `WLR_HAS_GLES2_RENDERER` says, which is the part a consumer observes.
+freedesktop.egl            = "1.7.0"
+freedesktop.glesv2         = "1.7.0"
+compat.libgbm              = "25.0.7"
+
 [features]
 # The set a compositor on real hardware actually runs: DRM for outputs,
 # libinput for devices, libseat+udev for the session, GLES2 for rendering, GBM
@@ -240,13 +271,6 @@ freedesktop.libdisplay-info = "0.2.0"
 [feature-deps.libinput]
 compat.libinput = "1.31.3"
 
-[feature-deps.gles2]
-freedesktop.egl        = "1.7.0"
-freedesktop.glesv2     = "1.7.0"
-compat.libgbm          = "25.0.7"
-
-[feature-deps.gbm]
-compat.libgbm          = "25.0.7"
 
 # ─────────────────────────────────────────────────────────────────────────
 # ⚠️ A WARNING YOU WILL SEE, AND WHY IT IS NOT THIS PACKAGE'S TO FIX

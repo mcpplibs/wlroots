@@ -947,21 +947,6 @@ void register_feature_sources(const features &f)
         add("render/egl.c");
         for (const char *n : {"pass.c", "pixel_format.c", "renderer.c", "texture.c"})
             mcpp::source((g_up / "render" / "gles2" / n).lexically_normal().string().c_str());
-
-        // ⚠️ `[feature-deps]` BUILDS a dependency but does not LINK it.
-        //
-        // Measured: with `freedesktop.egl` in `[feature-deps.gles2]`, mcpp
-        // resolved it, built `bin/libEGL.so.1` — and left `-lEGL` off the link
-        // line, so `render/egl.c` produced 30-odd undefined references to
-        // eglMakeCurrent and friends. Plain `[dependencies]` (libdrm, libudev,
-        // wayland) do contribute `-l` flags; feature ones did not.
-        //
-        // `mcpp::link_lib` is the right place regardless, because it REACHES
-        // THE CONSUMER'S LINK LINE — the asymmetry `include_dir` does not have.
-        // wlroots is kind="lib", so its objects merge into a compositor and it
-        // is the compositor's link that needs these.
-        mcpp::link_lib("EGL");
-        mcpp::link_lib("GLESv2");
     }
 
     if (f.gbm)     add("render/allocator/gbm.c");
