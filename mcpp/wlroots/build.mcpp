@@ -36,6 +36,10 @@
 #include <string>
 #include <vector>
 
+#include <spawn.h>
+#include <sys/wait.h>
+extern char **environ;
+
 import mcpp;
 
 namespace fs = std::filesystem;
@@ -328,6 +332,62 @@ bool embed_shaders()
 // Only the 13 XMLs wlroots ships itself. The other 32 come from
 // freedesktop.wayland-protocols-{stable,staging,unstable}, already scanned and
 // compiled; generating them again would define every interface twice.
+// ⚠️ THE SCANNER IS RUN HERE, NOT DECLARED AS AN ACTION.
+//
+// `mcpp::action` is the designed way to declare generated sources, and it is
+// the right one for a `.c` file: mcpp fixes the source set during prepare and
+// schedules the action before the compile that needs it. It is NOT enough for
+// a HEADER, because nothing declares a dependency on a header — the module
+// interface unit is compiled first, since every other translation unit needs
+// its BMI, and it reaches the protocol headers through wlroots' own public
+// headers. Measured over four CI rounds, never reproducible locally:
+//
+//   wlr_layer_shell_v1.h:73: use of enum
+//   'zwlr_layer_surface_v1_keyboard_interactivity' without previous declaration
+//
+// — an include that SUCCEEDED against a file the action had created and not
+// yet filled. A missing file says "No such file or directory"; this did not,
+// four times, which is what finally identified it.
+//
+// So the scanner runs during `build.mcpp`, before mcpp has fixed anything, and
+// every generated header exists by the time any compiler is started. Thirteen
+// protocols × three outputs is 39 invocations of a program that takes
+// milliseconds; build.mcpp itself is cached on `rerun_if_changed`, so this
+// costs nothing on an incremental build.
+//
+// `posix_spawn`, not `std::system`: no shell is involved, so no argument
+// needs quoting and the tree stays free of anything a shell would interpret.
+bool run_scanner(const char *scanner, const char *mode, const fs::path &xml,
+                 const fs::path &out)
+{
+    std::error_code ec;
+    fs::create_directories(out.parent_path(), ec);
+
+    const std::string x = xml.string(), o = out.string();
+    char *argv[] = {const_cast<char *>(scanner), const_cast<char *>(mode),
+                    const_cast<char *>(x.c_str()), const_cast<char *>(o.c_str()),
+                    nullptr};
+    pid_t pid = 0;
+    if (posix_spawn(&pid, scanner, nullptr, nullptr, argv, environ) != 0) {
+        note("cannot run %s\n", scanner);
+        return false;
+    }
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        note("wayland-scanner %s failed on %s\n", mode, xml.filename().string().c_str());
+        return false;
+    }
+    // An empty output is the failure this whole arrangement exists to prevent,
+    // so it is checked rather than assumed.
+    if (!fs::exists(out, ec) || fs::file_size(out, ec) == 0) {
+        note("wayland-scanner %s produced nothing for %s\n", mode,
+             xml.filename().string().c_str());
+        return false;
+    }
+    mcpp::rerun_if_changed(xml.string().c_str());
+    return true;
+}
+
 std::set<std::string> scan_own_protocols(const char *scanner)
 {
     std::set<std::string> own;
@@ -371,27 +431,18 @@ std::set<std::string> scan_own_protocols(const char *scanner)
             {"client-header", "-client-protocol.h", true},
         };
         for (const auto &k : kinds) {
-            const std::string id   = std::string("wayland-scanner:") + base + k.suffix;
-            const std::string desc = std::string("wayland-scanner ") + k.mode + " " + base;
             // ⚠️ layer-shell's two HEADERS are written under a different name.
             // They are the only generated headers a shim has to stand in front
             // of — the protocol has an argument called `namespace`, so the
-            // scanner's output is not valid C++ — and now that headers live in
+            // scanner's output is not valid C++ — and since headers live in
             // g_inc alongside the shim, the shim and the real file would
-            // otherwise be the same path and the action would overwrite it.
-            // The shim owns the name wlroots includes; the raw output gets its
-            // own.
+            // otherwise be the same path. The shim owns the name wlroots
+            // includes; the raw output gets its own.
             const bool shimmed = k.header && base == "wlr-layer-shell-unstable-v1";
             const std::string name = shimmed ? base + ".raw" + k.suffix : base + k.suffix;
-            const std::string out  = ((k.header ? g_inc : g_out) / name).string();
-            mcpp::action a;
-            a.id          = id.c_str();
-            a.role        = "source";
-            a.description = desc.c_str();
-            a.arg(scanner).arg(k.mode).arg(xml.string().c_str()).arg(out.c_str())
-             .input(xml.string().c_str())
-             .output(out.c_str())
-             .submit();
+            const fs::path out = (k.header ? g_inc : g_out) / name;
+            if (!run_scanner(scanner, k.mode, xml, out)) std::exit(1);
+            if (!k.header) mcpp::generated(out.string().c_str());
         }
     }
     note("protocols: %zu scanned here\n", own.size());
