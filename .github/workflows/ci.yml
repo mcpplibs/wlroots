@@ -62,9 +62,14 @@ jobs:
       - name: refresh the index
         run: mcpp index update
 
+      # `toolchain default` alone fails with "llvm@ is not installed": the
+      # runner image carries only the default toolchain, so the payload has to
+      # be fetched before it can be selected.
       - name: select toolchain
         if: matrix.toolchain == 'llvm'
-        run: mcpp toolchain default llvm
+        run: |
+          mcpp toolchain install llvm
+          mcpp toolchain default llvm
 
       - name: build and test
         run: |
@@ -84,12 +89,28 @@ jobs:
             grep -qx "#define WLR_HAS_$off 0" include/wlr/config.h || {
               echo "::error::WLR_HAS_$off is not 0, but the manifest does not offer it"; exit 1; }
           done
-          n=$(find target -name '*.o' | wc -l)
-          echo "objects: $n"
-          # Fewer than a thousand means whole subsystems did not compile — the
-          # failure mode where a package is green and empty.
-          [ "$n" -gt 1000 ] || { echo "::error::only $n objects; something did not compile"; exit 1; }
-          echo "module exports: $(grep -c '^using ::' src/wlroots.cppm)"
+          # ⚠️ COUNT THE GENERATED ARTIFACTS, NOT THE OBJECTS.
+          #
+          # A total object count is not comparable between a runner and a
+          # developer's tree: locally the dependencies also build into target/
+          # and the number is 2191, on a runner it is 481, and a threshold
+          # calibrated on either one is a coin flip rather than a check. It
+          # failed here for exactly that reason.
+          #
+          # These four counts follow from upstream's own file lists and the
+          # pinned data, so each has a right answer that does not depend on
+          # where the build ran.
+          o=target/.build-mcpp/out
+          p=$(ls $o/*-protocol.c 2>/dev/null | wc -l)
+          s=$(ls $o/*_src.h 2>/dev/null | wc -l)
+          c=$(grep -c 'case PNP_ID' $o/pnpids.c)
+          e=$(grep -c '^using ::' src/wlroots.cppm)
+          echo "protocols scanned: $p   shaders: $s   PNP entries: $c   module exports: $e"
+          [ "$p" -eq 13 ]   || { echo "::error::$p protocols scanned, expected the 13 wlroots ships"; exit 1; }
+          [ "$s" -eq 5 ]    || { echo "::error::$s shader headers, expected 5"; exit 1; }
+          [ "$c" -gt 2500 ] || { echo "::error::only $c PNP entries; the pinned pnp.ids has 2557"; exit 1; }
+          [ "$e" -gt 900 ]  || { echo "::error::only $e module exports; the header scan missed something"; exit 1; }
+          echo "objects: $(find target -name '*.o' | wc -l)"
 
       # The pinned pnp.ids is the whole reason the DRM backend's manufacturer
       # lookup is reproducible. Upstream's gen_pnpids.sh reads the BUILD
