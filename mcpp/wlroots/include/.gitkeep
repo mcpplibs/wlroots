@@ -1,0 +1,12 @@
+# `include/` is written by build.mcpp on every build: config.h, wlr/config.h,
+# wlr/version.h, the C++-rewritten copies of two upstream headers, and the
+# layer-shell shims. Nothing in here is checked in.
+#
+# THIS FILE EXISTS SO THE DIRECTORY DOES.
+#
+# mcpp reads the manifest's `include_dirs` and builds the compiler command line
+# BEFORE it runs build.mcpp, and it silently drops an entry that does not exist
+# yet. Measured 2026-08-31: on the first build of a fresh clone the generated
+# config.h was written correctly and then ignored, because `include` had not
+# been on the -I list — and eleven wlroots sources read compat.libinput's
+# config.h instead, failing with `HAVE_EVENTFD undeclared`.

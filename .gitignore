@@ -1,0 +1,22 @@
+# Nothing here is checked in; both trees are written by build.mcpp on every
+# build. See §14 of the graphics-stack design doc: an artifact produced at
+# build time cannot disagree with the data it came from, which is the whole
+# reason not to commit it.
+mcpp/wlroots/target/
+mcpp/wlroots/include/*
+!mcpp/wlroots/include/.gitkeep
+mcpp/wlroots/src/
+
+# The PROJECT-LEVEL store. mcpp puts dependencies here instead of the global
+# one when the workspace declares `[indices]` with a path — which is how this
+# fork was developed against an unmerged index PR. It is a cache of other
+# people's packages and has no business in this repo.
+.mcpp/
+compile_commands.json
+mcpp.lock
+
+# upstream/ is never filtered. cairo's fork learned this the hard way: a
+# project's own .gitignore files take effect when a fork commits its tree, and
+# five files that WERE in the release tarball got silently dropped. wlroots
+# ships one .gitignore of its own, so the same guard applies here.
+!upstream/**

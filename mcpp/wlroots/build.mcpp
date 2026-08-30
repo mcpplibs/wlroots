@@ -1,0 +1,1070 @@
+// wlroots — everything upstream's meson generates, done by a C++ program.
+//
+// Upstream reaches for meson's configure_file, three shell scripts and
+// wayland-scanner. `build.mcpp` is compiled and run by mcpp, so all of it is
+// ordinary C++ here and the tree carries no sh and no python:
+//
+//   upstream                                  here
+//   ────────────────────────────────────────  ───────────────────────────────
+//   configure_file → include/wlr/config.h     write_public_config()
+//   configure_file → include/wlr/version.h    write_version()
+//   configure_file → include/config.h         write_internal_config()
+//   backend/drm/gen_pnpids.sh                 write_pnpids()
+//   render/gles2/shaders/embed.sh             embed_shaders()
+//   render/gles2/shaders/check.sh             dropped — a glslang lint over
+//                                             upstream shaders that a fork
+//                                             does not change
+//   custom_target(wayland_scanner, ×45)       scan_own_protocols() ×13, plus
+//                                             forward_protocol_headers() for
+//                                             the 32 the index already builds
+//
+// ⭐ AND THE FEATURE SELECTION, which upstream does in meson and which would
+// otherwise have to live in `[features].sources`. It cannot: feature sources
+// match LITERAL entries, so a file a glob excluded with `!` can never be added
+// back, and wlroots keeps feature-gated files inside otherwise-unconditional
+// directories. `mcpp::has_feature()` answers here, so the whole conditional
+// graph is one function you can read top to bottom.
+
+#include <algorithm>
+#include <cstdio>
+#include <cstdint>
+#include <filesystem>
+#include <fstream>
+#include <map>
+#include <set>
+#include <sstream>
+#include <string>
+#include <vector>
+
+import mcpp;
+
+namespace fs = std::filesystem;
+
+namespace {
+
+fs::path g_root, g_up, g_out;
+
+// ⚠️ `config.h` IS THE MOST CONTESTED FILE NAME IN C, and the include path
+// this package compiles against has SIX of them on it — measured:
+//
+//     #6  compat.libinput/mcpp_generated/config.h      ← the one that won
+//     #27 freedesktop.libxkbcommon/…/generated/config.h
+//     #31 freedesktop.wayland/…/config.h
+//     #37 freedesktop.wayland-scanner/…/config.h
+//     #40 freedesktop.wayland-server/…/config.h
+//     #46 freedesktop.libevdev/…/generated/config.h
+//     #59 ours
+//
+// Eleven wlroots sources write `#include "config.h"`, so they were reading
+// libinput's, and `if (!HAVE_EVENTFD)` — which wlroots uses as an ORDINARY C
+// EXPRESSION, not a preprocessor test — failed with `HAVE_EVENTFD undeclared`.
+//
+// `mcpp::include_dir()` cannot fix it: a build program's include dirs are
+// appended AFTER every dependency's, which is why ours was 59th of 59. The
+// manifest's `include_dirs` come FIRST, so the generated headers go into a
+// directory named there — `mcpp/wlroots/include`, written by this program the
+// same way `src/wlroots.cppm` is, and for the same reason: a static name the
+// manifest can point at, produced before compilation.
+fs::path g_inc;   // <manifest>/include — generated, FIRST on the include path
+
+// ⚠️ NEVER write to stderr without flushing stdout first.
+//
+// build.mcpp's STDOUT IS THE PROTOCOL — every `mcpp::` call is a line on it —
+// and mcpp reads both streams through one pipe. stdout is block-buffered when
+// piped, stderr is not, so a bare `fprintf(stderr, …)` is delivered while a
+// half-written directive still sits in stdout's buffer, and the two splice:
+//
+//   mcpp:action={"id":…,"command":[…,"/…/wlr-vprotocols: 13 scanned here
+//                                            ^ stderr lands mid-JSON
+//   error: build.mcpp declared a malformed action.
+//
+// which blames the action. Measured here 2026-08-31: 39 actions is enough
+// stdout to cross a buffer boundary, one earlier fork with three directives
+// never did, and that is the whole difference between the two.
+template <class... A>
+void note(const char *fmt, A... a)
+{
+    std::fflush(stdout);
+    std::fprintf(stderr, fmt, a...);
+    std::fflush(stderr);
+}
+
+struct features {
+    bool drm, libinput, session, gles2, gbm, udmabuf;
+};
+
+// ── endianness ───────────────────────────────────────────────────────────────
+//
+// wlroots tests these with `#if WLR_BIG_ENDIAN`, so BOTH spellings must always
+// be DEFINED, as 0 or 1. That is the opposite of the rule cairo needed
+// (`#ifdef WORDS_BIGENDIAN`, where defining it to 0 says "yes, big-endian" and
+// silently corrupts every path). The test style decides, not the name — and
+// the only way to know is to read the consumer.
+//
+// Decided here rather than passed as
+// `-DWLR_BIG_ENDIAN=(__BYTE_ORDER__==__ORDER_BIG_ENDIAN__)`, which looks
+// tidier and is a trap: on a compiler that predefines neither macro the
+// expression becomes `0 == 0` and claims BIG-endian — the cairo failure again,
+// wearing a different name.
+bool big_endian(const std::string &arch)
+{
+    static const char *be[] = {
+        "s390", "s390x", "sparc", "sparc64", "m68k",
+        "powerpc", "ppc", "ppc64",     // ppc64le is little-endian and absent here
+        "mips", "mips64",              // mipsel/mips64el likewise
+    };
+    return std::find_if(std::begin(be), std::end(be),
+                        [&](const char *n) { return arch == n; }) != std::end(be);
+}
+
+// ── generated headers ────────────────────────────────────────────────────────
+
+// include/wlr/config.h — the PUBLIC feature report. A compositor reads it to
+// know whether `<wlr/backend/drm.h>` is usable, so it has to say what this
+// build actually did.
+void write_public_config(const features &f)
+{
+    fs::create_directories(g_inc / "wlr");
+    std::ofstream o(g_inc / "wlr" / "config.h");
+    o << "/* GENERATED by build.mcpp — upstream generates this from\n"
+         " * include/wlr/config.h.in with meson's configure_file. */\n"
+         "#ifndef WLR_CONFIG_H\n"
+         "#define WLR_CONFIG_H\n\n"
+         "/* Every one of these is ALWAYS DEFINED, as 0 or 1, because wlroots\n"
+         " * tests them with `#if` and not `#ifdef`. Leaving one out would make\n"
+         " * `#if WLR_HAS_X` silently false instead of a diagnostic. */\n";
+    auto set = [&](const char *n, bool v) { o << "#define " << n << ' ' << (v ? 1 : 0) << '\n'; };
+    set("WLR_HAS_DRM_BACKEND",       f.drm);
+    set("WLR_HAS_LIBINPUT_BACKEND",  f.libinput);
+    set("WLR_HAS_X11_BACKEND",       false);
+    set("WLR_HAS_GLES2_RENDERER",    f.gles2);
+    set("WLR_HAS_VULKAN_RENDERER",   false);
+    set("WLR_HAS_GBM_ALLOCATOR",     f.gbm);
+    set("WLR_HAS_UDMABUF_ALLOCATOR", f.udmabuf);
+    set("WLR_HAS_XWAYLAND",          false);
+    set("WLR_HAS_SESSION",           f.session);
+    set("WLR_HAS_COLOR_MANAGEMENT",  false);
+    o << "\n#endif\n";
+}
+
+void write_version()
+{
+    std::ofstream o(g_inc / "wlr" / "version.h");
+    o << "/* GENERATED by build.mcpp from upstream/include/wlr/version.h.in. */\n"
+         "#ifndef WLR_VERSION_H\n"
+         "#define WLR_VERSION_H\n\n"
+         "#define WLR_VERSION_STR \"0.20.2\"\n"
+         "#define WLR_VERSION_MAJOR 0\n"
+         "#define WLR_VERSION_MINOR 20\n"
+         "#define WLR_VERSION_MICRO 2\n\n"
+         "#define WLR_VERSION_NUM ((WLR_VERSION_MAJOR << 16) | "
+         "(WLR_VERSION_MINOR << 8) | WLR_VERSION_MICRO)\n\n"
+         "int wlr_version_get_major(void);\n"
+         "int wlr_version_get_minor(void);\n"
+         "int wlr_version_get_micro(void);\n\n"
+         "#endif\n";
+}
+
+// include/config.h — the INTERNAL one, `#include "config.h"` from eleven
+// sources. Answers describe THIS build's dependencies, not upstream's defaults:
+// that distinction is what turned eight undefined references into a day's
+// hunting on fontconfig.
+void write_internal_config(const features &f)
+{
+    std::ofstream o(g_inc / "config.h");
+    o << "/* GENERATED by build.mcpp — upstream builds it with meson's\n"
+         " * configure_file from `internal_config`. */\n"
+         "#ifndef WLR_INTERNAL_CONFIG_H\n"
+         "#define WLR_INTERNAL_CONFIG_H\n\n"
+         "/* Linux, and this package only builds on Linux: eventfd and\n"
+         " * linux/sync_file.h have been there far longer than any kernel that\n"
+         " * runs a Wayland compositor. */\n"
+         "#define HAVE_EVENTFD 1\n"
+         "#define HAVE_LINUX_SYNC_FILE 1\n\n"
+         "/* compat.libinput is 1.31.3, well past the 1.26.0 that introduced\n"
+         " * libinput_device_get_id_bustype. Guarded by the libinput feature\n"
+         " * because with the backend off nothing reads it. */\n"
+         "#define HAVE_LIBINPUT_BUSTYPE " << (f.libinput ? 1 : 0) << "\n\n"
+         "/* Not offered: see the manifest for why each is absent rather than\n"
+         " * merely off. */\n"
+         "#define HAVE_XCB_ERRORS 0\n"
+         "#define HAVE_LIBLIFTOFF 0\n"
+         "#define HAVE_LIBLIFTOFF_0_5 0\n\n"
+         "/* EGL is what the GLES2 renderer needs; upstream sets this from\n"
+         " * whether both egl and gbm resolved. */\n"
+         "#define HAVE_EGL " << (f.gles2 ? 1 : 0) << "\n\n"
+         "/* Where XCursor themes live. Upstream defaults to\n"
+         " * <prefix>/share/icons; the ecosystem's is whatever\n"
+         " * XCURSOR_PATH names at run time, so the compiled-in value is only a\n"
+         " * last resort and the FHS location is the honest one. */\n"
+         "#define ICONDIR \"/usr/share/icons\"\n\n"
+         "#endif\n";
+}
+
+// ── backend/drm/gen_pnpids.sh, as C++ ────────────────────────────────────────
+//
+// Upstream feeds hwdata's pnp.ids through a shell script into a switch over a
+// packed 15-bit key. Two differences here, both deliberate:
+//
+//   1. The input is PINNED. Upstream reads `/usr/share/hwdata/pnp.ids` off the
+//      BUILD MACHINE, so a monitor's manufacturer depends on where the package
+//      was built. Same trap freedesktop.libdisplay-info documents, same fix,
+//      and the same pinned hwdata v0.410 file.
+//   2. Key collisions are DETECTED. PNP_ID keeps only the low five bits of
+//      each character, so 'inu' and 'INU' collide — and hwdata really does
+//      carry lowercase ids ('inu') and one with a punctuation character
+//      ('VQ@'). Upstream's script would emit two identical `case` labels and
+//      the failure would surface as a compile error inside generated code.
+//      Here it is an error that names both ids.
+bool write_pnpids()
+{
+    const fs::path ids = g_root / ".." / "data" / "pnp.ids";
+    std::ifstream in(ids);
+    if (!in) {
+        note("cannot read the pinned pnp.ids at %s\n",
+                     ids.string().c_str());
+        return false;
+    }
+
+    std::map<uint32_t, std::pair<std::string, std::string>> bykey;  // key -> (id, vendor)
+    std::string line;
+    while (std::getline(in, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        const std::size_t sep = line.find_first_of(" \t");
+        if (sep == std::string::npos) continue;
+        const std::string id = line.substr(0, sep);
+        if (id.size() != 3) continue;
+        std::string vendor = line.substr(line.find_first_not_of(" \t", sep));
+        while (!vendor.empty() && (vendor.back() == ' ' || vendor.back() == '\t'))
+            vendor.pop_back();
+
+        const auto k = static_cast<uint32_t>(
+            ((id[0] & 0x1f) << 10) | ((id[1] & 0x1f) << 5) | (id[2] & 0x1f));
+        auto [it, fresh] = bykey.emplace(k, std::pair{id, vendor});
+        if (!fresh) {
+            note("pnp.ids: '%s' and '%s' pack to the same 15-bit PNP_ID key %u.\n"
+                "PNP_ID keeps only the low five bits of each character, so ids\n"
+                "differing solely in case or in punctuation collide. Upstream's\n"
+                "gen_pnpids.sh would emit two identical `case` labels.\n",
+                it->second.first.c_str(), id.c_str(), k);
+            return false;
+        }
+    }
+
+    const fs::path out = g_out / "pnpids.c";
+    std::ofstream o(out);
+    o << "/* GENERATED by build.mcpp from mcpp/data/pnp.ids (hwdata v0.410),\n"
+         " * replacing upstream's backend/drm/gen_pnpids.sh. */\n"
+         "#include \"backend/drm/util.h\"\n\n"
+         "#define PNP_ID(a, b, c) ((a & 0x1f) << 10) | ((b & 0x1f) << 5) | (c & 0x1f)\n"
+         "const char *get_pnp_manufacturer(const char code[static 3]) {\n"
+         "\tswitch (PNP_ID(code[0], code[1], code[2])) {\n";
+    for (const auto &[k, v] : bykey) {
+        const std::string &id = v.first;
+        o << "\tcase PNP_ID('" << id[0] << "', '" << id[1] << "', '" << id[2]
+          << "'): return \"";
+        // Escape as BYTES, not code points. hwdata carries UTF-8 vendor names
+        // and a code-point escape would emit a single byte above 0x7f, which is
+        // not valid UTF-8 — the bug found in libdisplay-info's own generator.
+        for (unsigned char c : v.second) {
+            if (c == '"' || c == '\\') o << '\\' << char(c);
+            else if (c >= 0x20 && c < 0x7f) o << char(c);
+            else { char b[8]; std::snprintf(b, sizeof b, "\\%03o", c); o << b; }
+        }
+        o << "\";\n";
+    }
+    o << "\t}\n\treturn NULL;\n}\n#undef PNP_ID\n";
+    o.close();
+
+    mcpp::generated(out.string().c_str());
+    mcpp::rerun_if_changed(ids.string().c_str());
+    note("pnpids.c: %zu manufacturers\n", bykey.size());
+    return true;
+}
+
+// ── render/gles2/shaders/embed.sh, as C++ ────────────────────────────────────
+//
+// `od -A n -t x1 -v` piped into a `for` loop, one shell fork per shader. The
+// output is a C array of the shader's bytes with a NUL appended; renderer.c
+// includes the five headers by name.
+bool embed_shaders()
+{
+    const fs::path dir = g_up / "render" / "gles2" / "shaders";
+    static const char *shaders[] = {
+        "common.vert", "quad.frag", "tex_rgba.frag", "tex_rgbx.frag",
+        "tex_external.frag",
+    };
+    for (const char *name : shaders) {
+        std::ifstream in(dir / name, std::ios::binary);
+        if (!in) {
+            note("missing shader %s\n", name);
+            return false;
+        }
+        const std::string body((std::istreambuf_iterator<char>(in)),
+                               std::istreambuf_iterator<char>());
+        // `common.vert` → `common_vert_src`, matching meson's underscorify().
+        std::string var(name);
+        std::replace(var.begin(), var.end(), '.', '_');
+        const std::string header = var + "_src.h";
+        var += "_src";
+
+        std::ofstream o(g_out / header);
+        o << "/* GENERATED by build.mcpp from render/gles2/shaders/" << name
+          << ", replacing upstream's embed.sh. */\n"
+          << "static const char " << var << "[] = {\n";
+        for (unsigned char c : body) {
+            char b[16];
+            std::snprintf(b, sizeof b, "\t0x%02x,\n", c);
+            o << b;
+        }
+        o << "\t0x00,\n};\n";
+        mcpp::rerun_if_changed((dir / name).string().c_str());
+    }
+    return true;
+}
+
+// ── the protocols ────────────────────────────────────────────────────────────
+//
+// Only the 13 XMLs wlroots ships itself. The other 32 come from
+// freedesktop.wayland-protocols-{stable,staging,unstable}, already scanned and
+// compiled; generating them again would define every interface twice.
+std::set<std::string> scan_own_protocols(const char *scanner)
+{
+    std::set<std::string> own;
+    const fs::path dir = g_up / "protocol";
+    std::vector<fs::path> xmls;
+    std::error_code ec;
+    for (const auto &e : fs::directory_iterator(dir, ec))
+        if (e.path().extension() == ".xml") xmls.push_back(e.path());
+    std::sort(xmls.begin(), xmls.end());
+
+    for (const auto &xml : xmls) {
+        const std::string base = xml.stem().string();
+        own.insert(base);
+        mcpp::rerun_if_changed(xml.string().c_str());
+
+        // Three outputs, three scanner invocations — one action each, because
+        // an action runs one command. Names follow wlroots' own convention:
+        // the SERVER header is `<base>-protocol.h`, which is what makes the
+        // forwarding headers below necessary for everything else.
+        struct { const char *mode; const char *suffix; } kinds[] = {
+            {"private-code",  "-protocol.c"},
+            {"server-header", "-protocol.h"},
+            {"client-header", "-client-protocol.h"},
+        };
+        for (const auto &k : kinds) {
+            const std::string id   = std::string("wayland-scanner:") + base + k.suffix;
+            const std::string desc = std::string("wayland-scanner ") + k.mode + " " + base;
+            const std::string out  = (g_out / (base + k.suffix)).string();
+            mcpp::action a;
+            a.id          = id.c_str();
+            a.role        = "source";
+            a.description = desc.c_str();
+            a.arg(scanner).arg(k.mode).arg(xml.string().c_str()).arg(out.c_str())
+             .input(xml.string().c_str())
+             .output(out.c_str())
+             .submit();
+        }
+    }
+    note("protocols: %zu scanned here\n", own.size());
+    return own;
+}
+
+// The 32 that come from the index, under the name wlroots expects.
+//
+// wlroots writes `#include "xdg-shell-protocol.h"`; the index packages install
+// `xdg-shell-server-protocol.h`. Same scanner, same mode, same bytes — only the
+// file name differs, so a one-line forwarding header is the whole fix.
+//
+// The set is DISCOVERED by scanning what wlroots includes rather than listed,
+// so a version bump that adds a protocol produces a missing-header error naming
+// it, instead of this file quietly falling behind.
+void forward_protocol_headers(const std::set<std::string> &own)
+{
+    std::set<std::string> wanted;
+    std::error_code ec;
+    for (const auto &e : fs::recursive_directory_iterator(g_up, ec)) {
+        if (!e.is_regular_file()) continue;
+        const auto ext = e.path().extension();
+        if (ext != ".c" && ext != ".h") continue;
+        std::ifstream f(e.path());
+        std::string l;
+        while (std::getline(f, l)) {
+            const std::size_t h = l.find("#include");
+            if (h == std::string::npos) continue;
+            const std::size_t a = l.find_first_of("\"<", h);
+            if (a == std::string::npos) continue;
+            const std::size_t b = l.find_first_of("\">", a + 1);
+            if (b == std::string::npos) continue;
+            const std::string inc = l.substr(a + 1, b - a - 1);
+            static const std::string tail = "-protocol.h";
+            if (inc.size() <= tail.size()) continue;
+            if (inc.compare(inc.size() - tail.size(), tail.size(), tail) != 0) continue;
+            if (inc.find('/') != std::string::npos) continue;   // not one of ours
+            const std::string base = inc.substr(0, inc.size() - tail.size());
+            // `<name>-client-protocol.h` also ends in "-protocol.h"; the index
+            // packages already spell those exactly the way wlroots does.
+            if (base.size() > 7 && base.compare(base.size() - 7, 7, "-client") == 0)
+                continue;
+            if (!own.count(base)) wanted.insert(base);
+        }
+    }
+    // ⚠️ FORWARD ONLY WHAT A DEPENDENCY ACTUALLY PROVIDES.
+    //
+    // Forwarding on name shape alone produced `wayland-server-protocol.h` →
+    // `#include <wayland-server-server-protocol.h>`, which does not exist —
+    // and worse, the generated file SHADOWED libwayland's own header of that
+    // name, so the failure appeared in unrelated translation units. libwayland
+    // ships `wayland-server-protocol.h` and `wayland-client-protocol.h`
+    // itself; they end in `-protocol.h` and are not wayland-protocols
+    // protocols.
+    //
+    // The check is existence rather than a deny-list, so a name nobody
+    // anticipated is skipped with a note instead of shadowing something.
+    // ⚠️ BOTH SPELLINGS, and a hard failure if neither answers.
+    //
+    // `dep_bin` keys on the bare package NAME while the manifest writes the
+    // namespaced one, so which spelling `dep_dir` wants is not obvious — and
+    // the failure mode is an empty string, indistinguishable from "not
+    // declared". Getting it wrong here made `provided()` answer false for
+    // everything and forwarded ZERO headers, which surfaced 200 lines later as
+    // `xdg-decoration-unstable-v1-protocol.h: No such file or directory` in an
+    // unrelated source file. A lookup whose miss is silent has to be checked
+    // at the lookup.
+    std::vector<fs::path> provider_dirs;
+    for (const char *pkg : {"wayland-protocols-stable", "wayland-protocols-staging",
+                            "wayland-protocols-unstable"}) {
+        const char *d = mcpp::dep_dir(pkg);
+        if (!d || !*d) {
+            const std::string qualified = std::string("freedesktop.") + pkg;
+            d = mcpp::dep_dir(qualified.c_str());
+        }
+        // ⚠️ `dep_dir` answers with the dependency MEMBER's manifest directory,
+        // not the package root: measured, `.../wayland-protocols-1.49.1/mcpp/
+        // staging`. The generated headers are its SIBLING `mcpp/generated`, so
+        // the search starts one level up. Searching the manifest dir itself
+        // finds a mcpp.toml and a tests/ and nothing else — and then forwards
+        // zero headers, silently.
+        if (d && *d) provider_dirs.emplace_back(fs::path(d).parent_path());
+        else note("protocols: dep_dir found nothing for %s\n", pkg);
+    }
+    if (provider_dirs.empty()) {
+        note("no wayland-protocols package directory resolved, so not one of the\n"
+             "32 protocols this fork does not scan itself can be forwarded. The\n"
+             "build would fail much later with a missing `*-protocol.h`.\n");
+        std::exit(1);
+    }
+    auto provided = [&](const std::string &base) {
+        const std::string want = base + "-server-protocol.h";
+        std::error_code e2;
+        for (const auto &d : provider_dirs)
+            for (const auto &x : fs::recursive_directory_iterator(d, e2))
+                if (x.is_regular_file() && x.path().filename() == want) return true;
+        return false;
+    };
+
+    std::size_t made = 0, skipped = 0;
+    for (const auto &base : wanted) {
+        if (!provided(base)) {
+            note("protocols: %s-protocol.h not forwarded — no dependency ships "
+                 "%s-server-protocol.h\n", base.c_str(), base.c_str());
+            ++skipped;
+            continue;
+        }
+        std::ofstream o(g_out / (base + "-protocol.h"));
+        o << "/* GENERATED by build.mcpp.\n"
+             " *\n"
+             " * wlroots names a protocol's SERVER header `<name>-protocol.h`;\n"
+             " * freedesktop.wayland-protocols-* installs the same bytes as\n"
+             " * `<name>-server-protocol.h`. Forwarding is the whole difference —\n"
+             " * generating the protocol a second time here would define every\n"
+             " * interface in it twice, because those packages are kind=\"lib\"\n"
+             " * and their objects merge into this one. */\n"
+          << "#include <" << base << "-server-protocol.h>\n";
+        ++made;
+    }
+    note("protocols: %zu forwarded from the index, %zu left alone\n", made, skipped);
+}
+
+// ── the module ───────────────────────────────────────────────────────────────
+//
+// 121 public headers and NOT ONE `extern "C"` block — measured. A C++ consumer
+// that includes them mangles every declaration and the link fails naming
+// symbols that are right there in the library. `import wlroots;` does the
+// wrapping once, here.
+//
+// GENERATED rather than hand-written: the surface is 439 types and some 700
+// functions, which nobody keeps correct by hand across a version bump. A name
+// upstream removes becomes a compile error in THIS repo's CI rather than a
+// consumer's.
+//
+// ⚠️ MACROS DO NOT CROSS A MODULE BOUNDARY. `wl_container_of`, `wl_list_for_each`
+// and wlroots' own `WLR_*` macros are preprocessor entities and importing gets
+// none of them. A consumer that needs those includes the header as well — which
+// is safe, because the header's declarations and the module's are the same
+// entities.
+// ⚠️ wlroots' PUBLIC HEADERS ARE NOT VALID C++, and that is the real reason
+// this module exists.
+//
+// Five declarations across `render/color.h` and `types/wlr_scene.h` use C99's
+// array-parameter form:
+//
+//     void wlr_scene_rect_set_color(struct wlr_scene_rect *rect,
+//                                   const float color[static 4]);
+//
+// C++ has no `[static N]`. g++ reports `expected primary-expression before
+// 'static'` and then — because the parse never recovers — every later
+// declaration in the file as "has not been declared", which sends you looking
+// for missing feature guards. The first error is the only real one.
+//
+// So a C++ consumer cannot `#include <wlr/types/wlr_scene.h>` at all, with or
+// without an `extern "C"` wrapper. `import wlroots;` is not a convenience
+// here; it is the only way in.
+//
+// The fix is the smallest one that works: copy just the affected headers into
+// `<out>/cxx/wlr/…` with `[static N]` reduced to `[N]`, and put that directory
+// FIRST on the include path so those two paths resolve to the copies and the
+// other 119 still come from upstream. `static` in an array parameter is a
+// promise to the optimiser about minimum length and non-nullness — dropping it
+// changes no ABI and no semantics for the caller.
+// ── the second incompatibility: C++ KEYWORDS AS STRUCT MEMBER NAMES ──────────
+//
+// Three members in the whole public API, measured:
+//
+//     types/wlr_layer_shell_v1.h:89    char *namespace;
+//     types/wlr_input_method_v2.h:30   struct …_delete_surrounding_text delete;
+//     xwayland/xwayland.h:149          char *class;      (header already excluded)
+//
+// C++ cannot spell those names at all, so offering `namespace_` is not a
+// renaming of upstream's API — it is the only rendering of it that exists on
+// this side. The C declaration is kept verbatim under `#else`, so a C consumer
+// sees upstream exactly, and both arms declare the same type at the same
+// offset: identical layout, identical ABI, one spelling per language.
+//
+// Deliberately NOT done with `#define namespace namespace_` around the
+// include, which is shorter and wrong: the wlr headers pull <stdint.h> and
+// friends, libstdc++ routes those through <cstdint>, and `namespace std` in a
+// system header would then expand to `namespace_ std`.
+bool keyword_member(const std::string &line, std::string &head, std::string &kw)
+{
+    static const char *kws[] = {
+        "namespace", "delete", "class", "new", "this", "operator", "template",
+        "private", "public", "protected", "virtual", "export", "explicit",
+        "typename", "friend", "mutable", "using", "throw", "try", "catch",
+        "bool", "true", "false", "and", "or", "not", "xor", "compl",
+    };
+    std::size_t e = line.find_last_not_of(" \t");
+    if (e == std::string::npos || line[e] != ';') return false;
+    e = line.find_last_not_of(" \t", e - 1);
+    if (e == std::string::npos) return false;
+    std::size_t s = e + 1;
+    while (s > 0 && (std::isalnum((unsigned char)line[s - 1]) || line[s - 1] == '_')) --s;
+    const std::string name = line.substr(s, e + 1 - s);
+    // The member has to be preceded by a type, or this is not a declaration.
+    if (s == 0 || line.find_first_not_of(" \t") == s) return false;
+    for (const char *k : kws)
+        if (name == k) { head = line.substr(0, s); kw = name; return true; }
+    return false;
+}
+
+bool cxx_rewrite(const std::string &rel, const fs::path &src)
+{
+    std::ifstream in(src);
+    const std::string body((std::istreambuf_iterator<char>(in)),
+                           std::istreambuf_iterator<char>());
+
+    // Pass 1: C++ keyword members, line by line.
+    std::string staged;
+    bool touched_member = false;
+    {
+        std::istringstream ls(body);
+        std::string line, head, kw;
+        while (std::getline(ls, line)) {
+            if (keyword_member(line, head, kw)) {
+                staged += "#ifdef __cplusplus\n";
+                staged += head + kw + "_;   /* `" + kw +
+                          "` is a C++ keyword; same offset, same type */\n";
+                staged += "#else\n";
+                staged += line + "\n";
+                staged += "#endif\n";
+                touched_member = true;
+            } else {
+                staged += line + "\n";
+            }
+        }
+    }
+
+    if (!touched_member && body.find("[static") == std::string::npos) return false;
+
+    // Pass 2: C99 array-parameter declarators.
+    const std::string &src_body = staged;
+    std::string out;
+    out.reserve(src_body.size());
+    for (std::size_t i = 0; i < src_body.size();) {
+        // `[` ws* `static` ws+ digits ws* `]`  →  `[` digits `]`
+        if (src_body[i] == '[') {
+            std::size_t j = i + 1;
+            while (j < src_body.size() && std::isspace((unsigned char)src_body[j])) ++j;
+            if (src_body.compare(j, 6, "static") == 0) {
+                std::size_t k = j + 6;
+                while (k < src_body.size() && std::isspace((unsigned char)src_body[k])) ++k;
+                std::size_t d = k;
+                while (d < src_body.size() && std::isdigit((unsigned char)src_body[d])) ++d;
+                std::size_t c = d;
+                while (c < src_body.size() && std::isspace((unsigned char)src_body[c])) ++c;
+                if (d > k && c < src_body.size() && src_body[c] == ']') {
+                    out += '[';
+                    out.append(src_body, k, d - k);
+                    out += ']';
+                    i = c + 1;
+                    continue;
+                }
+            }
+        }
+        out += src_body[i++];
+    }
+
+    const fs::path dst = g_inc / "wlr" / rel;
+    std::error_code ec;
+    fs::create_directories(dst.parent_path(), ec);
+    std::ofstream o(dst);
+    o << "/* GENERATED by build.mcpp from upstream/include/wlr/" << rel << ".\n"
+         " *\n"
+         " * Identical to upstream except that C99 array-parameter declarators\n"
+         " * `[static N]` are reduced to `[N]`, because C++ has no such syntax\n"
+         " * and the header is otherwise unparseable by a C++ compiler. The\n"
+         " * `static` is an optimiser hint about minimum length; removing it\n"
+         " * changes neither the ABI nor what a caller may pass. */\n"
+      << out;
+    return true;
+}
+
+// ⚠️ ONE Wayland protocol names an argument `namespace`.
+//
+// wlr-layer-shell-unstable-v1 has `<arg name="namespace" type="string"/>`, so
+// wayland-scanner emits
+//
+//     void (*get_layer_surface)(…, const char *namespace);
+//
+// which is a syntax error in C++ and in nothing else. Measured across all 133
+// generated protocol headers in this build, layer-shell is the ONLY one — the
+// scanner does not sanitise C++ keywords and does not need to for the other 132.
+//
+// The shim goes in the generated include dir, which is FIRST, and reaches the
+// real header with `#include_next`. In C it expands to nothing at all; in C++
+// it renames the parameter for the duration of one header. Renaming a parameter
+// in a declaration changes no type and no ABI.
+//
+// Done here rather than in the module so that a consumer who writes the
+// ordinary `#include <wlr/types/wlr_layer_shell_v1.h>` gets it too — the same
+// rule that says an adaptation layer must not change upstream's normal usage.
+void write_layer_shell_shim()
+{
+    for (const char *n : {"wlr-layer-shell-unstable-v1-protocol.h",
+                          "wlr-layer-shell-unstable-v1-client-protocol.h"}) {
+        std::ofstream o(g_inc / n);
+        o << "/* GENERATED by build.mcpp.\n"
+             " *\n"
+             " * wlr-layer-shell-unstable-v1 has an argument called `namespace`,\n"
+             " * so the scanner's output is not valid C++. This shim renames it\n"
+             " * for C++ translation units and is transparent to C ones.\n"
+             " *\n"
+             " * `#include_next` continues the search PAST this directory, which\n"
+             " * is how it reaches the scanner's real output while shadowing its\n"
+             " * name. GCC and Clang both support it; wlroots builds with no\n"
+             " * other compiler. */\n"
+             "#ifdef __cplusplus\n"
+             "#define namespace wlr_layer_surface_namespace_\n"
+             "#endif\n"
+             "#include_next <" << n << ">\n"
+             "#ifdef __cplusplus\n"
+             "#undef namespace\n"
+             "#endif\n";
+    }
+}
+
+void write_module(const features &f)
+{
+    const fs::path inc = g_up / "include" / "wlr";
+
+    // Headers left out, and each for a reason that would otherwise be a
+    // compile error rather than a missing name.
+    auto excluded = [&](const std::string &rel) {
+        if (rel == "render/vulkan.h")   return true;   // needs vulkan_core.h; renderer not offered
+        if (rel.rfind("xwayland", 0) == 0) return true;   // needs xcb/*
+        if (rel == "xwayland.h")        return true;
+        if (rel == "backend/x11.h")     return true;   // WLR_HAS_X11_BACKEND is 0
+        if (rel == "backend/libinput.h") return !f.libinput;   // needs libinput.h
+        if (rel == "render/egl.h")      return !f.gles2;       // needs EGL/egl.h
+        if (rel == "render/gles2.h")    return !f.gles2;       // needs GLES2/gl2.h
+        if (rel == "backend/drm.h")     return !f.drm;
+        if (rel == "types/wlr_drm_lease_v1.h") return !f.drm;
+        if (rel == "backend/session.h") return !f.session;
+        return false;
+    };
+
+    std::vector<std::string> headers, types, funcs;
+    std::size_t rewritten = 0;
+    std::error_code ec;
+
+    // BOTH trees, upstream's and the generated one. `wlr/version.h` exists only
+    // in the generated tree — upstream ships `version.h.in` — and it declares
+    // wlr_version_get_major/minor/micro. Scanning only upstream left those three
+    // out of the module, and a consumer that called them got
+    // `'wlr_version_get_major' was not declared in this scope` from a header it
+    // could see on the include path, which reads like a module bug and is not.
+    //
+    // The generated tree is scanned FIRST so that a rewritten copy claims the
+    // relative path and upstream's original is then skipped as a duplicate.
+    std::set<std::string> seen;
+    std::vector<std::pair<fs::path, bool>> roots = {
+        {g_inc / "wlr", false},   // generated: version.h, config.h, rewritten copies
+        {inc,           true},    // upstream
+    };
+    for (const auto &[root, is_upstream] : roots)
+    for (const auto &e : fs::recursive_directory_iterator(root, ec)) {
+        if (!e.is_regular_file() || e.path().extension() != ".h") continue;
+        const std::string rel = fs::relative(e.path(), root, ec).generic_string();
+        if (excluded(rel) || !seen.insert(rel).second) continue;
+        headers.push_back(rel);
+        mcpp::rerun_if_changed(e.path().string().c_str());
+        if (is_upstream && cxx_rewrite(rel, e.path())) ++rewritten;
+
+        std::ifstream h(e.path());
+        std::string l;
+        bool in_block_comment = false;
+        while (std::getline(h, l)) {
+            // Skip comments before matching. wlroots documents nearly every
+            // function in a `/** ... */` block that NAMES it with parentheses,
+            // so a matcher that ignored them would emit hundreds of
+            // `using ::` declarations for things that are only prose.
+            std::string code;
+            for (std::size_t i = 0; i < l.size(); ++i) {
+                if (in_block_comment) {
+                    if (l[i] == '*' && i + 1 < l.size() && l[i + 1] == '/') { in_block_comment = false; ++i; }
+                } else if (l[i] == '/' && i + 1 < l.size() && l[i + 1] == '*') {
+                    in_block_comment = true; ++i;
+                } else if (l[i] == '/' && i + 1 < l.size() && l[i + 1] == '/') {
+                    break;
+                } else {
+                    code += l[i];
+                }
+            }
+            if (code.find_first_not_of(" \t") == std::string::npos) continue;
+
+            // A type: `struct wlr_foo {`, `enum wlr_foo {`, `union wlr_foo {`,
+            // or a forward declaration. Must start the line — a member such as
+            // `struct wl_listener destroy;` is indented.
+            //
+            // ⚠️ `struct wlr_scene *wlr_scene_create(void);` ALSO starts with
+            // `struct `, and taking it for a type declaration is what silently
+            // dropped wlr_scene_create, wlr_scene_rect_create and every other
+            // function returning a pointer to a struct — 986 exports that
+            // looked complete and were not. What follows the tag name decides:
+            // `{` or `;` is a declaration, anything else is a return type.
+            static const char *kw[] = {"struct ", "enum ", "union "};
+            bool matched = false;
+            for (const char *k : kw) {
+                const std::size_t n = std::string(k).size();
+                if (code.compare(0, n, k) != 0) continue;
+                std::size_t i = n, j = n;
+                while (j < code.size() && (isalnum((unsigned char)code[j]) || code[j] == '_')) ++j;
+                if (j == i) break;
+                std::size_t t = code.find_first_not_of(" \t", j);
+                const bool is_decl = t == std::string::npos || code[t] == '{' || code[t] == ';';
+                if (!is_decl) break;             // a return type — fall through to the
+                types.push_back(code.substr(i, j - i));   // function matcher below
+                matched = true;
+                break;
+            }
+            if (matched) continue;
+
+            // A function: a declaration line ending in `;` or `(` whose last
+            // identifier before the first `(` starts with `wlr_`. The return
+            // type sits on the same line, which is what makes this reliable.
+            const std::size_t p = code.find('(');
+            if (p == std::string::npos) continue;
+            if (code[0] == ' ' || code[0] == '\t' || code[0] == '#') continue;
+            std::size_t e2 = p;
+            while (e2 > 0 && (code[e2 - 1] == ' ' || code[e2 - 1] == '\t')) --e2;
+            std::size_t s = e2;
+            while (s > 0 && (isalnum((unsigned char)code[s - 1]) || code[s - 1] == '_')) --s;
+            if (s == e2) continue;
+            const std::string name = code.substr(s, e2 - s);
+            if (name.rfind("wlr_", 0) != 0) continue;
+            // `(*wlr_foo)(...)` is a function-pointer member, not a function.
+            if (s > 0 && code[s - 1] == '*' && s > 1 && code[s - 2] == '(') continue;
+            funcs.push_back(name);
+        }
+    }
+
+    auto uniq = [](std::vector<std::string> &v) {
+        std::sort(v.begin(), v.end());
+        v.erase(std::unique(v.begin(), v.end()), v.end());
+    };
+    std::sort(headers.begin(), headers.end());
+    uniq(types); uniq(funcs);
+
+    // The aggregate header the module fragment includes. Also useful on its own
+    // to a C++ consumer that wants the declarations without the module.
+    {
+        std::ofstream a(g_inc / "wlroots_all.h");
+        a << "/* GENERATED by build.mcpp: every public wlroots header this build\n"
+             " * offers, inside one `extern \"C\"` block.\n"
+             " *\n"
+             " * wlroots' headers carry no `extern \"C\"` of their own — measured,\n"
+             " * zero across all 121 — so a C++ translation unit that includes\n"
+             " * them mangles every declaration and fails to link naming symbols\n"
+             " * the library plainly contains.\n"
+             " *\n"
+             " * The header set follows THIS BUILD's features: with the DRM\n"
+             " * backend off, <wlr/backend/drm.h> is not here, because its\n"
+             " * declarations would name functions this library does not have. */\n"
+             "#ifndef MCPP_WLROOTS_ALL_H\n"
+             "#define MCPP_WLROOTS_ALL_H\n\n"
+             "/* wlroots refuses to compile without this, by #error. It is\n"
+             " * upstream's way of saying the API is not frozen. */\n"
+             "#ifndef WLR_USE_UNSTABLE\n#define WLR_USE_UNSTABLE\n#endif\n\n"
+             "extern \"C\" {\n";
+        for (const auto &h : headers) a << "#include <wlr/" << h << ">\n";
+        a << "}\n\n#endif\n";
+    }
+
+    const fs::path mod = g_root / "src" / "wlroots.cppm";
+    fs::create_directories(mod.parent_path(), ec);
+    std::ofstream m(mod);
+    m << "// wlroots, as a C++23 module.\n"
+         "//\n"
+         "// GENERATED by build.mcpp from upstream/include/wlr/**.h. Do not edit:\n"
+         "// a version bump regenerates it, which is the point — a name upstream\n"
+         "// added or removed cannot be silently missed.\n"
+         "//\n"
+         "// The header set follows THIS BUILD's features. With the DRM backend\n"
+         "// off, <wlr/backend/drm.h> is not wrapped, because its declarations\n"
+         "// would name functions this library does not contain.\n"
+         "//\n"
+         "// ⚠️ Macros do not cross a module boundary: wl_container_of,\n"
+         "// wl_list_for_each and the WLR_* macros are preprocessor entities, so\n"
+         "// a consumer that needs them includes the header too. That is safe —\n"
+         "// the header's declarations and this module's are the same entities.\n"
+         "module;\n\n"
+         "// ⚠️ ONE #include, not 119 wrapped in `extern \"C\" { … }` here.\n"
+         "//\n"
+         "// A global module fragment may contain PREPROCESSING DIRECTIVES ONLY.\n"
+         "// `extern \"C\" {` is a declaration, and GCC says so:\n"
+         "//\n"
+         "//   warning: global module fragment contents must be from preprocessor\n"
+         "//   inclusion [-Wglobal-module]\n"
+         "//\n"
+         "// So the extern \"C\" block lives in a generated header and the fragment\n"
+         "// holds a directive, which is what the fragment is for.\n"
+         "#include <wlroots_all.h>\n\n"
+         "export module wlroots;\n\nexport {\n\n"
+      << "// ── types (" << types.size() << ") ──\n";
+    for (const auto &t : types) m << "using ::" << t << ";\n";
+    m << "\n// ── functions (" << funcs.size() << ") ──\n";
+    for (const auto &fn : funcs) m << "using ::" << fn << ";\n";
+    m << "\n} // export\n";
+    m.close();
+    note("module: %zu headers, %zu types, %zu functions, %zu rewritten for C++\n",
+         headers.size(), types.size(), funcs.size(), rewritten);
+}
+
+// ── the feature-gated source set ─────────────────────────────────────────────
+// ── dmabuf: LET THE COMPILER ANSWER, not a configure step ────────────────────
+//
+// `render/dmabuf_linux.c` uses DMA_BUF_IOCTL_IMPORT_SYNC_FILE, added to
+// <linux/dma-buf.h> in Linux 6.0. Where the kernel headers predate it — the
+// case in this ecosystem's sysroot — the file does not compile, and upstream
+// picks `dmabuf_fallback.c` instead. The two export exactly the same three
+// symbols; the fallback answers "no explicit sync" and everything above it
+// copes.
+//
+// Upstream decides with a meson probe (`cc.has_define(...)`). Doing that here
+// would mean a build program running a compiler it would have to locate first
+// — and the compiler it found might not be the one that compiles the package.
+//
+// Instead the generated TU asks the preprocessor, in the include path that
+// actually applies, at the moment the file is compiled. `__has_include` is C23
+// and has been in GCC and Clang for a decade. This cannot disagree with the
+// real build, which a separate probe always can.
+void write_dmabuf_tu()
+{
+    const fs::path tu = g_out / "mcpp_dmabuf.c";
+    std::ofstream o(tu);
+    o << "/* GENERATED by build.mcpp.\n"
+         " *\n"
+         " * Upstream chooses between dmabuf_linux.c and dmabuf_fallback.c with a\n"
+         " * meson probe. This asks the preprocessor of the compiler that is\n"
+         " * actually building the file, so the answer cannot disagree with the\n"
+         " * build it configures. Both files define the same three symbols. */\n"
+         "#if defined(__has_include)\n"
+         "#  if __has_include(<linux/dma-buf.h>)\n"
+         "#    include <linux/dma-buf.h>\n"
+         "#  endif\n"
+         "#endif\n\n"
+         "#ifdef DMA_BUF_IOCTL_IMPORT_SYNC_FILE\n"
+         "#  include \"" << (g_up / "render" / "dmabuf_linux.c").lexically_normal().string() << "\"\n"
+         "#else\n"
+         "#  include \"" << (g_up / "render" / "dmabuf_fallback.c").lexically_normal().string() << "\"\n"
+         "#endif\n";
+    o.close();
+    mcpp::generated(tu.string().c_str());
+}
+
+void register_feature_sources(const features &f)
+{
+    auto add = [&](const char *rel) {
+        mcpp::source((g_up / rel).lexically_normal().string().c_str());
+    };
+
+    if (f.session) add("backend/session/session.c");
+
+    if (f.drm) {
+        for (const char *n : {"atomic.c", "backend.c", "drm.c", "fb.c", "legacy.c",
+                              "monitor.c", "properties.c", "renderer.c", "util.c"})
+            mcpp::source((g_up / "backend" / "drm" / n).lexically_normal().string().c_str());
+
+        // `types/wlr_drm_lease_v1.c` is excluded by `!` in the manifest, because
+        // its 108 siblings are taken by a glob. A `!` exclusion is ABSOLUTE, so
+        // it is added back as a generated one-line translation unit — a path the
+        // exclusion cannot match.
+        const fs::path shim = g_out / "mcpp_wlr_drm_lease_v1.c";
+        std::ofstream(shim)
+            << "/* GENERATED by build.mcpp. See the manifest: this file exists\n"
+               " * because a `!` exclusion in `sources` cannot be undone by a\n"
+               " * feature, and types/ is otherwise globbed. */\n"
+            << "#include \"" << (g_up / "types" / "wlr_drm_lease_v1.c").lexically_normal().string() << "\"\n";
+        mcpp::generated(shim.string().c_str());
+    }
+
+    if (f.libinput)
+        for (const char *n : {"backend.c", "events.c", "keyboard.c", "pointer.c",
+                              "switch.c", "tablet_pad.c", "tablet_tool.c", "touch.c"})
+            mcpp::source((g_up / "backend" / "libinput" / n).lexically_normal().string().c_str());
+
+    if (f.gles2) {
+        add("render/egl.c");
+        for (const char *n : {"pass.c", "pixel_format.c", "renderer.c", "texture.c"})
+            mcpp::source((g_up / "render" / "gles2" / n).lexically_normal().string().c_str());
+
+        // ⚠️ `[feature-deps]` BUILDS a dependency but does not LINK it.
+        //
+        // Measured: with `freedesktop.egl` in `[feature-deps.gles2]`, mcpp
+        // resolved it, built `bin/libEGL.so.1` — and left `-lEGL` off the link
+        // line, so `render/egl.c` produced 30-odd undefined references to
+        // eglMakeCurrent and friends. Plain `[dependencies]` (libdrm, libudev,
+        // wayland) do contribute `-l` flags; feature ones did not.
+        //
+        // `mcpp::link_lib` is the right place regardless, because it REACHES
+        // THE CONSUMER'S LINK LINE — the asymmetry `include_dir` does not have.
+        // wlroots is kind="lib", so its objects merge into a compositor and it
+        // is the compositor's link that needs these.
+        mcpp::link_lib("EGL");
+        mcpp::link_lib("GLESv2");
+    }
+
+    if (f.gbm)     add("render/allocator/gbm.c");
+    if (f.udmabuf) add("render/allocator/udmabuf.c");
+}
+
+} // namespace
+
+int main()
+{
+    if (std::string(mcpp::target_os()) != "linux") {
+        note("wlroots is Linux-only: it is built on DRM/KMS, libinput and\n"
+                   "udev, none of which exist elsewhere.\n");
+        return 1;
+    }
+
+    g_root = fs::path(mcpp::manifest_dir());
+    g_up   = (g_root / ".." / ".." / "upstream").lexically_normal();
+    g_out  = fs::path(mcpp::out_dir());
+    g_inc  = g_root / "include";
+
+    const features f{
+        .drm      = mcpp::has_feature("drm"),
+        .libinput = mcpp::has_feature("libinput"),
+        .session  = mcpp::has_feature("session"),
+        .gles2    = mcpp::has_feature("gles2"),
+        .gbm      = mcpp::has_feature("gbm"),
+        .udmabuf  = mcpp::has_feature("udmabuf"),
+    };
+
+    // Upstream's own rule, from backend/meson.build:14. Said here because the
+    // failure it prevents is a link error listing wlr_session_* symbols, which
+    // names the symptom and not the cause.
+    if ((f.drm || f.libinput) && !f.session) {
+        note("the drm and libinput features both require `session`:\n"
+                   "  default-features = false, features = [\"session\", \"drm\"]\n");
+        return 1;
+    }
+
+    std::error_code ec;
+    fs::create_directories(g_out, ec);
+    // The generated subtree is wiped each run so a header that stopped being
+    // generated — a feature turned off, an upstream file renamed — stops
+    // shadowing too. The DIRECTORY ITSELF survives, and `include/.gitkeep`
+    // with it, because mcpp reads `include_dirs` BEFORE running this program
+    // and SILENTLY DROPS an entry that does not exist yet. Measured: on the
+    // first build of a fresh clone the generated config.h was written and then
+    // ignored, because `include` had not been on the -I list when the command
+    // line was built.
+    fs::remove_all(g_inc / "wlr", ec);
+    fs::create_directories(g_inc / "wlr", ec);
+    for (const char *stale : {"wlr-layer-shell-unstable-v1-protocol.h",
+                              "wlr-layer-shell-unstable-v1-client-protocol.h",
+                              "wlroots_all.h", "config.h"})
+        fs::remove(g_inc / stale, ec);
+
+    write_public_config(f);
+    write_version();
+    write_internal_config(f);
+
+    const std::string arch = mcpp::target_arch();
+    mcpp::cflag(big_endian(arch) ? "-DWLR_BIG_ENDIAN=1"    : "-DWLR_BIG_ENDIAN=0");
+    mcpp::cflag(big_endian(arch) ? "-DWLR_LITTLE_ENDIAN=0" : "-DWLR_LITTLE_ENDIAN=1");
+    // Upstream passes this empty so private struct members are visible to its
+    // own translation units. A consumer that does not define it gets the same
+    // empty expansion from the headers' own fallback.
+    mcpp::cflag("-DWLR_PRIVATE=");
+    mcpp::cflag("-DWLR_USE_UNSTABLE");
+
+    // ⚠️ `dep_bin` keys on the package's NAME, not on the namespaced spelling
+    // the manifest uses: mcpp reports the tool as `wayland-scanner:wayland-
+    // scanner`, so `MCPP_DEP_WAYLAND_SCANNER_BIN_WAYLAND_SCANNER` is the
+    // variable that exists and the `freedesktop.`-qualified form answers "".
+    // Both are tried because the qualified one is what a reader expects and a
+    // future mcpp may well set it too — and the failure mode of guessing wrong
+    // is an empty string, which looks exactly like "the tool was not declared".
+    const char *scanner = mcpp::dep_bin("wayland-scanner", "wayland-scanner");
+    if (!scanner || !*scanner)
+        scanner = mcpp::dep_bin("freedesktop.wayland-scanner", "wayland-scanner");
+    if (!scanner || !*scanner) {
+        note("no wayland-scanner. The manifest must ask for the tool, not\n"
+                   "just the package:\n"
+                   "  freedesktop.wayland-scanner = { version = \"1.26.0\", "
+                   "tools = [\"wayland-scanner\"] }\n");
+        return 1;
+    }
+
+    write_layer_shell_shim();
+
+    const std::set<std::string> own = scan_own_protocols(scanner);
+    forward_protocol_headers(own);
+
+    if (f.drm && !write_pnpids()) return 1;
+    if (f.gles2 && !embed_shaders()) return 1;
+
+    write_dmabuf_tu();
+    register_feature_sources(f);
+    write_module(f);
+
+    // The generated tree carries wlr/config.h, wlr/version.h, config.h, the
+    // protocol headers, the forwarding headers and the shader arrays.
+    mcpp::include_dir(g_out.string().c_str());
+
+    mcpp::rerun_if_changed("build.mcpp");
+    return 0;
+}

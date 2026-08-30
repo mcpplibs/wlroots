@@ -1,0 +1,268 @@
+# wlroots — the compositor library the whole graphics stack was built toward.
+#
+# Everything wlroots needs was already in this index before this package
+# existed: wayland-server/client/protocols/scanner/egl, libdrm, pixman,
+# xkbcommon, libinput, libudev, libseat, egl, glesv2, gbm, libdisplay-info.
+# This is the package that spends them.
+#
+# ─────────────────────────────────────────────────────────────────────────
+# WHY A FORK, AND WHY EVERY CONDITIONAL LIVES IN build.mcpp
+#
+# wlroots has SIX generators, which is what decides fork-versus-descriptor
+# (the criterion is generators, not line count):
+#
+#   1. 45 Wayland protocols → wayland-scanner, three outputs each
+#   2. pnpids.c             → gen_pnpids.sh over hwdata's pnp.ids
+#   3. include/wlr/config.h → WLR_HAS_* per enabled feature
+#   4. include/config.h     → internal HAVE_*
+#   5. include/wlr/version.h
+#   6. five GLSL shaders    → embed.sh, hex-encoded into C arrays
+#
+# Three of those are shell scripts upstream. None of them is a shell script
+# here: `build.mcpp` is a compiled C++ program, so gen_pnpids.sh and embed.sh
+# are reimplemented in it and check.sh (a glslang lint) is dropped — it
+# validates upstream's shaders, which do not change in a fork.
+#
+# ⭐ THE FEATURE SELECTION ALSO LIVES IN build.mcpp, and that is not a
+# stylistic choice. `[features].sources` matches LITERAL entries, so a feature
+# cannot add a file back that a glob excluded with `!` — the exclusion is
+# absolute. wlroots has feature-gated files sitting inside directories that are
+# otherwise wholly unconditional (`types/wlr_drm_lease_v1.c` among 108
+# siblings), so a glob-plus-exclusion arrangement would have to list all 108.
+#
+# `build.mcpp` can see the resolved feature set through `mcpp::has_feature()`
+# and register sources with `mcpp::source()`, so the whole conditional graph is
+# one readable block of C++ instead of a glob puzzle. `[features]` below
+# therefore carries only `defines` and, in `[feature-deps]`, dependencies.
+#
+# ─────────────────────────────────────────────────────────────────────────
+# THE PROTOCOLS ARE SPLIT, AND THE SPLIT IS FORCED
+#
+# wlroots generates all 45 protocols itself. Doing that here would define
+# `xdg_shell_interface` a second time, because this index already ships those
+# 32 as `freedesktop.wayland-protocols-{stable,staging,unstable}` with
+# `kind = "lib"` — objects merged eagerly into the consumer. Two definitions,
+# one link, duplicate symbols.
+#
+# So the 32 come from those packages and only the 13 wlroots ships itself are
+# scanned here. The one mismatch is spelling: wlroots writes its server header
+# as `<name>-protocol.h`, the index packages as `<name>-server-protocol.h`.
+# build.mcpp emits 32 one-line forwarding headers to bridge it. Client headers
+# already agree on `<name>-client-protocol.h` and need nothing.
+#
+# ─────────────────────────────────────────────────────────────────────────
+# WHAT IS DELIBERATELY NOT OFFERED
+#
+# `vulkan-renderer`  — needs glslang to compile four shaders to SPIR-V at build
+#                      time. glslang is not in this index, and a feature that
+#                      cannot build is worse than an absent one.
+# `x11-backend`      — needs xcb + xcb-errors; the point of this stack is a
+#                      compositor that does not drag X11 in.
+# `xwayland`         — same, plus a runtime Xwayland binary.
+# `color-management` — needs lcms2, not in this index. `color_fallback.c` is
+#                      built instead, which is upstream's own arrangement when
+#                      lcms2 is missing.
+#
+# Each is a real gap rather than a judgement that nobody wants it; they are
+# listed here so the absence is legible instead of mysterious.
+[package]
+namespace   = "wlroots"
+name        = "wlroots"
+version     = "0.20.2"
+standard    = "c++23"
+description = "wlroots — modular Wayland compositor library, with DRM/libinput/session/GLES2/pixman/GBM built and X11 left out"
+license     = "MIT"
+repo        = "https://gitlab.freedesktop.org/wlroots/wlroots"
+
+[build]
+# Base sources only. Everything feature-gated is registered by build.mcpp;
+# see the block above for why that is not a matter of taste.
+#
+# `render/*.c` is listed file by file rather than globbed because three of its
+# fifteen entries are alternatives, not members: `dmabuf_linux.c` XOR
+# `dmabuf_fallback.c`, `color_fallback.c` XOR `color_lcms2.c`, and `egl.c` only
+# with the GLES2 renderer. A glob would take all of them and the link would
+# have two definitions of the same function.
+sources = [
+    # ── backends that need nothing outside the index ──────────────────────
+    "../../upstream/backend/backend.c",
+    "../../upstream/backend/multi/*.c",
+    "../../upstream/backend/wayland/*.c",
+    "../../upstream/backend/headless/*.c",
+
+    # ── renderer core ─────────────────────────────────────────────────────
+    "../../upstream/render/color.c",
+    "../../upstream/render/color_fallback.c",
+    "../../upstream/render/dmabuf.c",
+    # dmabuf_linux.c XOR dmabuf_fallback.c is chosen by a generated TU that
+    # asks `__has_include` and `DMA_BUF_IOCTL_IMPORT_SYNC_FILE` — see
+    # write_dmabuf_tu() in build.mcpp. Neither is named here.
+    "../../upstream/render/drm_format_set.c",
+    "../../upstream/render/drm_syncobj.c",
+    "../../upstream/render/drm_syncobj_merger.c",
+    "../../upstream/render/pass.c",
+    "../../upstream/render/pixel_format.c",
+    "../../upstream/render/swapchain.c",
+    "../../upstream/render/wlr_renderer.c",
+    "../../upstream/render/wlr_texture.c",
+
+    # The pixman (software) renderer is unconditional upstream too — it is the
+    # fallback every compositor needs when there is no GPU.
+    "../../upstream/render/pixman/*.c",
+
+    # Allocators: these three need no GPU. `gbm.c` and `udmabuf.c` are gated.
+    "../../upstream/render/allocator/allocator.c",
+    "../../upstream/render/allocator/drm_dumb.c",
+    "../../upstream/render/allocator/shm.c",
+
+    # ── protocol implementations, utilities, cursors ──────────────────────
+    # 109 files, of which exactly one is conditional. Excluded here and added
+    # back by build.mcpp through a generated shim — a generated path cannot
+    # collide with this exclusion, which a `mcpp::source()` of the same path
+    # might.
+    "../../upstream/types/**/*.c",
+    "!../../upstream/types/wlr_drm_lease_v1.c",
+    "../../upstream/util/*.c",
+    "../../upstream/xcursor/*.c",
+
+    # Written by build.mcpp before compilation; named statically because
+    # `[lib] path` requires it.
+    "src/wlroots.cppm",
+]
+
+# `include/` carries both halves the same way libdisplay-info's does: public
+# headers under `wlr/`, private ones directly (`backend/drm/drm.h`,
+# `util/global.h`), so `#include <wlr/types/wlr_output.h>` and
+# `#include "util/global.h"` both resolve from one entry. The generated
+# `config.h`, `version.h`, protocol headers and shader arrays land in the out
+# dir, which build.mcpp adds itself.
+include_dirs = [
+    # FIRST, and that ordering is load-bearing. `include/` is written by
+    # build.mcpp and holds the generated `config.h` — a name six of this
+    # package's dependencies ALSO export. A build program's own
+    # `mcpp::include_dir()` is appended after every dependency's, so the
+    # generated config.h landed 59th of 59 and eleven wlroots sources read
+    # compat.libinput's instead. Manifest entries come first; this one has to.
+    "include",
+    "../../upstream/include",
+]
+
+cflags = [
+    # Upstream's own, from meson.build:23. wlroots is POSIX-2008 plus the
+    # Linux-specific pieces it uses directly (memfd, eventfd, sync_file).
+    "-D_POSIX_C_SOURCE=200809L",
+    "-D_GNU_SOURCE",
+    # Upstream compiles with these off; they fire in vendored protocol code and
+    # in the many designated-initialiser tables wlroots uses.
+    "-Wno-unused-parameter",
+    "-Wno-missing-field-initializers",
+    # A compositor is an executable, but wlroots is also linked into shared
+    # objects (plugins, language bindings), so the objects must be PIC.
+    "-fPIC",
+]
+
+# `-lm`: the renderer does matrix and colour arithmetic.
+# `-lrt`: `util/shm.c` uses shm_open; on glibc < 2.34 that lives in librt.
+ldflags = ["-lm", "-lrt"]
+
+[lib]
+# Generated by build.mcpp into src/ before compilation.
+path = "src/wlroots.cppm"
+
+# kind = "lib". Upstream ships libwlroots-0.20.so behind a version script that
+# exports only `wlr_*`, but nothing dlopens wlroots — a compositor links it at
+# build time — so merging the objects avoids a SONAME that would then have to
+# coexist with a distribution's copy. Same choice as freedesktop.libdisplay-info
+# and freedesktop.libevdev.
+[targets.wlroots]
+kind = "lib"
+
+[dependencies]
+# The 32 protocols wlroots does not ship itself. All three are needed: the
+# split across stable/staging/unstable is wayland-protocols' own.
+# Only these two. `stable` is NOT named here even though wlroots uses it:
+# staging and unstable each declare it as a workspace PATH dependency (they
+# reference xdg_toplevel_interface, which stable defines), and mcpp rejects a
+# package requested as both a path dep and a version dep. It arrives
+# transitively.
+freedesktop.wayland-protocols-staging  = "1.49.1"
+freedesktop.wayland-protocols-unstable = "1.49.1"
+
+# `tools = [...]` is what makes `mcpp::dep_bin()` answer for the scanner in
+# build.mcpp. Without it the dependency resolves, the build program compiles,
+# and `dep_bin` returns "" at run time.
+freedesktop.wayland-scanner = { version = "1.26.0", tools = ["wayland-scanner"] }
+
+freedesktop.wayland        = "1.26.0"
+freedesktop.wayland-server = "1.26.0"
+compat.libdrm              = "2.4.134"
+compat.pixman              = "0.46.4"
+freedesktop.libxkbcommon   = "1.13.2"
+
+[features]
+# The set a compositor on real hardware actually runs: DRM for outputs,
+# libinput for devices, libseat+udev for the session, GLES2 for rendering, GBM
+# for buffers. Everything here is in the index; nothing pulls in X11.
+default = ["drm", "libinput", "session", "gles2", "gbm"]
+
+[features.session]
+defines = ["MCPP_WLR_SESSION"]
+
+[features.drm]
+defines = ["MCPP_WLR_DRM"]
+
+[features.libinput]
+defines = ["MCPP_WLR_LIBINPUT"]
+
+[features.gles2]
+defines = ["MCPP_WLR_GLES2"]
+
+[features.gbm]
+defines = ["MCPP_WLR_GBM"]
+
+[features.udmabuf]
+defines = ["MCPP_WLR_UDMABUF"]
+
+# ⚠️ These defines exist so the feature set is visible in the preprocessor of
+# this package's own sources. They are NOT what wlroots itself tests — wlroots
+# reads `WLR_HAS_*` out of the generated `wlr/config.h`, which build.mcpp
+# writes from the same `has_feature()` answers. One source of truth, two
+# spellings, because upstream's spelling is a generated header and mcpp's is a
+# manifest key.
+
+[feature-deps.session]
+compat.libudev = "1.0.5"
+compat.libseat = "0.9.3"
+
+[feature-deps.drm]
+freedesktop.libdisplay-info = "0.2.0"
+
+[feature-deps.libinput]
+compat.libinput = "1.31.3"
+
+[feature-deps.gles2]
+freedesktop.egl        = "1.7.0"
+freedesktop.glesv2     = "1.7.0"
+compat.libgbm          = "25.0.7"
+
+[feature-deps.gbm]
+compat.libgbm          = "25.0.7"
+
+# ─────────────────────────────────────────────────────────────────────────
+# ⚠️ A WARNING YOU WILL SEE, AND WHY IT IS NOT THIS PACKAGE'S TO FIX
+#
+#     warning: wlroots: 79 symbols in this image are also provided by a
+#     library it loads.  XML_DefaultCurrent() … and 73 more
+#
+# `freedesktop.wayland-scanner` exists to provide a HOST TOOL, and it is
+# declared above only for that. But its `[build] sources` (wayland-util.c) and
+# its own dependency on `compat.expat` still reach the TARGET link — measured:
+# `obj/compat_expat/lib/{xmlparse,xmlrole,xmltok}.o` appear on the link line of
+# a binary that never calls expat.
+#
+# So a `tools = [...]` dependency is not host-only: it contributes objects like
+# any other. Nothing in this manifest changes that, and the two candidate fixes
+# both live elsewhere — either mcpp grows a host-only dependency form, or the
+# scanner member of mcpplibs/wayland stops exporting package-level sources.
+# Recorded here so the warning reads as a known, located issue rather than
+# something wrong with wlroots.

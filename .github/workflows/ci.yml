@@ -1,0 +1,123 @@
+name: ci
+
+# What this checks that a plain `mcpp build` does not:
+#
+#   - that the package builds on BOTH toolchains. The llvm leg uses lld and no
+#     sysroot, and in this ecosystem it has twice caught bugs gcc structurally
+#     cannot see (a `static inline` whose address forced TU-local emission; a
+#     <sstream> that libstdc++ includes transitively and libc++ does not).
+#   - that upstream/ is the release tarball, byte for byte. Everything this
+#     fork adds lives under mcpp/.
+#   - that the default feature set is the one the manifest claims — read out of
+#     the GENERATED wlr/config.h, because a green build proves only that the
+#     link succeeded, and a package can link having compiled nothing.
+on:
+  push:
+    branches: [ '**' ]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain: [default, llvm]
+    name: build (${{ matrix.toolchain }})
+    steps:
+      - uses: actions/checkout@v4
+
+      # XLINGS_NON_INTERACTIVE: without it the installer takes its `curl | bash`
+      # branch (`xlings self install < /dev/tty`) and a runner's /dev/tty is
+      # readable but not connected.
+      #
+      # XLINGS_VERSION pins the INSTALLER so a red run can be told apart from an
+      # ecosystem change. mcpp itself stays unpinned on purpose — this package
+      # depends on the current ecosystem, and a pinned mcpp carries a frozen
+      # snapshot of it.
+      #
+      # TWO PATH entries, and the second is the one that matters: `xlings`
+      # lands in ~/.xlings/bin, but `mcpp` is installed INTO THE SUBOS, so
+      # without subos/default/bin the next step dies with a bare
+      # `mcpp: command not found` that says nothing about why.
+      - name: Install xlings + mcpp
+        env:
+          XLINGS_NON_INTERACTIVE: "1"
+          XLINGS_VERSION: "2026.8.27.5"
+        run: |
+          curl -fsSL https://d2learn.org/xlings-install.sh | bash
+          echo "$HOME/.xlings/bin" >> "$GITHUB_PATH"
+          "$HOME/.xlings/bin/xlings" --version
+          "$HOME/.xlings/bin/xlings" install mcpp
+          echo "$HOME/.xlings/subos/default/bin" >> "$GITHUB_PATH"
+
+      # A clean runner carries the index snapshot of the day its image was
+      # built, so a package published since then is simply absent. This fork
+      # needs freedesktop.wayland-protocols-* 1.49.1, which is recent.
+      - name: refresh the index
+        run: mcpp index update
+
+      - name: select toolchain
+        if: matrix.toolchain == 'llvm'
+        run: mcpp toolchain default llvm
+
+      - name: build and test
+        run: |
+          cd mcpp/wlroots
+          mcpp test
+
+      - name: the generated wlr/config.h says what the manifest says
+        run: |
+          cd mcpp/wlroots
+          echo "--- include/wlr/config.h ---"
+          grep '^#define WLR_HAS' include/wlr/config.h
+          for on in DRM_BACKEND LIBINPUT_BACKEND SESSION GLES2_RENDERER GBM_ALLOCATOR; do
+            grep -qx "#define WLR_HAS_$on 1" include/wlr/config.h || {
+              echo "::error::WLR_HAS_$on is not 1, but it is in the default feature set"; exit 1; }
+          done
+          for off in X11_BACKEND VULKAN_RENDERER XWAYLAND COLOR_MANAGEMENT; do
+            grep -qx "#define WLR_HAS_$off 0" include/wlr/config.h || {
+              echo "::error::WLR_HAS_$off is not 0, but the manifest does not offer it"; exit 1; }
+          done
+          n=$(find target -name '*.o' | wc -l)
+          echo "objects: $n"
+          # Fewer than a thousand means whole subsystems did not compile — the
+          # failure mode where a package is green and empty.
+          [ "$n" -gt 1000 ] || { echo "::error::only $n objects; something did not compile"; exit 1; }
+          echo "module exports: $(grep -c '^using ::' src/wlroots.cppm)"
+
+      # The pinned pnp.ids is the whole reason the DRM backend's manufacturer
+      # lookup is reproducible. Upstream's gen_pnpids.sh reads the BUILD
+      # MACHINE's copy, so the failure this prevents looks exactly like a
+      # passing build.
+      - name: the pinned pnp.ids is NOT the runner's
+        if: matrix.toolchain == 'default'
+        run: |
+          if [ -f /usr/share/hwdata/pnp.ids ]; then
+            d=$(diff <(sort mcpp/data/pnp.ids) <(sort /usr/share/hwdata/pnp.ids) | grep -c '^[<>]' || true)
+            echo "pinned pnp.ids differs from the runner's by $d line(s)"
+          else
+            echo "the runner has no /usr/share/hwdata/pnp.ids — which is why upstream's fallback is a trap"
+          fi
+
+  upstream:
+    runs-on: ubuntu-latest
+    name: upstream/ is the release tarball, unmodified
+    steps:
+      - uses: actions/checkout@v4
+      - name: diff upstream/ against wlroots 0.20.2
+        run: |
+          curl -fsSL -o /tmp/u.tar.gz \
+            https://gitlab.freedesktop.org/wlroots/wlroots/-/archive/0.20.2/wlroots-0.20.2.tar.gz
+          mkdir -p /tmp/u && tar xzf /tmp/u.tar.gz -C /tmp/u --strip-components=1
+          if ! diff -r -q /tmp/u upstream >/dev/null 2>&1; then
+            echo "::error::upstream/ differs from wlroots 0.20.2. Everything this fork adds belongs under mcpp/."
+            diff -r -q /tmp/u upstream | head -20
+            exit 1
+          fi
+          echo "upstream/ is 0.20.2, unmodified"
